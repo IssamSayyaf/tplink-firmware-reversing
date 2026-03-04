@@ -391,6 +391,223 @@ This password grants **full root access** to the device — web interface, SSH (
 
 ---
 
+## Step 7: Extracting Every Secret from the Firmware
+
+After cracking the admin password, I performed a full credential audit across the entire firmware — searching every binary, config file, and script using `strings` and `grep`. Here is everything I found.
+
+### 7.1 — Default WiFi Password (WPA-PSK)
+
+**File:** `rootfs/etc/RT2860AP.dat` (MediaTek wireless driver configuration)
+
+```ini
+SSID1=RTDEV_AP
+AuthMode=OPEN
+EncrypType=NONE
+WPAPSK1=12345678
+```
+
+The default WPA Pre-Shared Key is hardcoded as `12345678`. Even though the default mode is OPEN (no encryption), when a user enables WPA/WPA2 security through the web interface, this is the starting PSK. Many users never change it.
+
+**How I found it:** Running `strings` on the wireless config file and searching for key-related fields:
+```bash
+strings rootfs/etc/RT2860AP.dat | grep -iE 'WPAPSK|Key|SSID'
+```
+
+| Field | Value |
+|-------|-------|
+| **Default SSID** | `RTDEV_AP` |
+| **Default WPA-PSK** | `12345678` |
+| **Auth Mode** | OPEN (no encryption by default) |
+
+---
+
+### 7.2 — WPS Key (Wi-Fi Protected Setup)
+
+**File:** `rootfs/etc/RT2860AP.dat`
+
+```ini
+WscNewKey=scaptest
+WscConfMode=0
+WscConfigured=0
+```
+
+`WscNewKey` is the key that WPS uses when configuring a new wireless client. The value `scaptest` appears to be a development/test key left in from manufacturing.
+
+**How I found it:**
+```bash
+strings rootfs/etc/RT2860AP.dat | grep -i Wsc
+```
+
+This is significant because WPS has known vulnerabilities (Reaver/Pixie-Dust attacks), and having a predictable key makes it even weaker.
+
+---
+
+### 7.3 — SSH (Dropbear) Credentials
+
+**Source:** `rootfs/lib/libcmm.so` (TP-Link's core configuration library)
+
+By running `strings` on the main configuration library:
+```bash
+strings rootfs/lib/libcmm.so | grep -A2 -B2 dropbearpwd
+```
+
+Output:
+```
+uname = %s, pswd = %s
+/var/tmp/dropbear/dropbearpwd
+username:%s
+password:%s
+```
+
+The boot sequence (visible in `console.txt`) shows:
+```
+prepareDropbear cmd is "dropbear -p 22 -r /var/tmp/dropbear/dropbear_rsa_host_key
+  -d /var/tmp/dropbear/dropbear_dss_host_key -A /var/tmp/dropbear/dropbearpwd"
+```
+
+**What this means:** At boot, the `cos` daemon writes the admin username and password (`admin`/`1234`) in plaintext to `/var/tmp/dropbear/dropbearpwd`. Dropbear SSH reads this file for authentication (`-A` flag). The SSH credentials are **identical** to the web admin credentials — same `admin`/`1234`.
+
+| Field | Value |
+|-------|-------|
+| **SSH Port** | 22 |
+| **Username** | `admin` |
+| **Password** | `1234` |
+| **Auth file** | `/var/tmp/dropbear/dropbearpwd` (plaintext) |
+
+---
+
+### 7.4 — TP-Link Tether App Encryption Key
+
+**Source:** `rootfs/usr/bin/tdpd` (TP-Link Device Protocol daemon)
+
+```bash
+strings rootfs/usr/bin/tdpd | grep -i tether
+```
+
+Output:
+```
+TETHER_KEY_V1_(%s)
+```
+
+The `tdpd` daemon handles communication with the **TP-Link Tether** mobile app. The encryption key used to secure this communication is derived from the device's MAC address using the format:
+
+```
+TETHER_KEY_V1_(B8:FB:B3:54:35:FA)
+```
+
+The MAC address is read from flash at offset `0x3FF100` (visible in `console.txt`):
+```
+Read MAC from flash(3ff100) b8-fb-b3-54-35-fa
+```
+
+**How to derive the key:**
+```python
+import hashlib
+
+mac = "B8:FB:B3:54:35:FA"  # from flash dump
+tether_key = f"TETHER_KEY_V1_({mac})"
+# The key is then MD5-hashed for use as a DES/AES key
+key_hash = hashlib.md5(tether_key.encode()).hexdigest()
+
+print(f"Tether key string: {tether_key}")
+print(f"Tether key MD5:    {key_hash}")
+```
+
+```
+Tether key string: TETHER_KEY_V1_(B8:FB:B3:54:35:FA)
+Tether key MD5:    82727eccff0d5b1179df3b347fdb8e8c
+```
+
+**Why this is a problem:** Anyone who knows the device's MAC address (broadcast in every WiFi frame) can derive the Tether encryption key and intercept/forge commands to the router from the mobile app.
+
+---
+
+### 7.5 — Web Interface Authentication Mechanism
+
+**Source:** `rootfs/web/js/tpEncrypt.js` + `rootfs/usr/bin/httpd`
+
+By analyzing the JavaScript and the `httpd` binary:
+```bash
+strings rootfs/usr/bin/httpd | grep -iE 'admin|auth|aes|rsa|md5'
+```
+
+The web login works as follows:
+
+1. The browser computes `MD5(username + password)` as an auth hash
+2. The server generates an RSA public key and sends it to the browser
+3. The browser generates a random AES-128-CBC key
+4. The AES key + auth hash are encrypted with RSA and sent to the server
+5. All subsequent communication is AES-encrypted
+
+```python
+import hashlib
+
+username = "admin"
+password = "1234"
+auth_hash = hashlib.md5((username + password).encode()).hexdigest()
+print(f"Web auth hash = MD5(\"{username}{password}\") = {auth_hash}")
+```
+
+```
+Web auth hash = MD5("admin1234") = c93ccd78b2076528346216b3b2f701e6
+```
+
+While the transport encryption (RSA + AES) is reasonable, the underlying auth is just MD5 of the credentials — no per-session salt, no PBKDF, no rate limiting beyond a simple `forbidTime` counter.
+
+---
+
+### 7.6 — Device MAC Addresses (from Flash)
+
+**Source:** `console.txt` (UART boot log) + flash dump at offset `0x3FF100`
+
+```
+Read MAC from flash(3ff100) B8:FB:B3:54:35:FA    # LAN MAC
+ifconfig eth0.2 hw ether B8:FB:B3:54:35:FB        # WAN MAC (LAN + 1)
+```
+
+| Interface | MAC Address | Purpose |
+|-----------|-------------|---------|
+| LAN (br0) | `B8:FB:B3:54:35:FA` | Bridge interface (WiFi + LAN ports) |
+| WAN (eth0.2) | `B8:FB:B3:54:35:FB` | Internet-facing interface |
+
+The WAN MAC is simply the LAN MAC + 1. Both are stored at flash offset `0x3FF100` inside the `radio` partition.
+
+---
+
+### 7.7 — TDDP Debug Protocol
+
+**Source:** `rootfs/usr/bin/tddp`
+
+```bash
+strings rootfs/usr/bin/tddp | grep -iE 'admin|password'
+```
+
+```
+admin
+adminName
+adminPwd
+```
+
+The **TP-Link Device Debug Protocol** (`tddp`) listens on **UDP port 1040** and uses the same admin credentials. This protocol has been the target of multiple CVEs (e.g., CVE-2019-17147) allowing unauthenticated remote code execution on TP-Link devices. It is enabled by default.
+
+---
+
+### Complete Credentials Summary
+
+| # | Secret | Value | Found In | Method |
+|---|--------|-------|----------|--------|
+| 1 | **Admin password** | `1234` | `etc/passwd.bak` | MD5-crypt hash cracked with Python |
+| 2 | **Default WiFi PSK** | `12345678` | `etc/RT2860AP.dat` | `strings` on config file |
+| 3 | **WPS setup key** | `scaptest` | `etc/RT2860AP.dat` | `strings` on config file |
+| 4 | **SSH password** | `1234` (same as admin) | `lib/libcmm.so` | `strings` revealed dropbear password path |
+| 5 | **Tether app key** | `TETHER_KEY_V1_(B8:FB:B3:54:35:FA)` | `usr/bin/tdpd` | `strings` + MAC from boot log |
+| 6 | **Web auth hash** | `c93ccd78b2076528346216b3b2f701e6` | `web/js/tpEncrypt.js` | Reverse-engineered JS auth flow |
+| 7 | **LAN MAC** | `B8:FB:B3:54:35:FA` | `console.txt` / flash `0x3FF100` | Boot log analysis |
+| 8 | **WAN MAC** | `B8:FB:B3:54:35:FB` | `console.txt` | Boot log analysis |
+| 9 | **TDDP uses admin creds** | `admin` / `1234` | `usr/bin/tddp` | `strings` on binary |
+
+---
+
 ## Security Observations
 
 1. **Hardcoded credentials** — The admin password hash (`1234`) is stored in `passwd.bak` within the firmware image, crackable in seconds with a simple Python script.
