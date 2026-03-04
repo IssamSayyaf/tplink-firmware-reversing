@@ -322,13 +322,82 @@ The `cos` binary (in `/usr/bin/`) is TP-Link's proprietary Configuration and Ope
 
 ---
 
+## Step 6: Cracking the Admin Password
+
+Inside the extracted rootfs, the file `etc/passwd.bak` contains the default credentials:
+
+```
+admin:$1$$iC.dUsGpxNNJGeOm1dFio/:0:0:root:/:/bin/sh
+```
+
+### Breaking Down the Hash
+
+The hash format is `$1$$iC.dUsGpxNNJGeOm1dFio/` which tells us:
+- **`$1$`** — This is an **MD5-crypt** hash (a weak, outdated hashing algorithm)
+- **`$$`** — The salt between the two `$` signs is **empty** — this is a critical weakness, as salts are meant to make each hash unique and prevent precomputation attacks
+- **`iC.dUsGpxNNJGeOm1dFio/`** — The actual hash digest
+
+### Cracking with Python
+
+Since MD5-crypt with an empty salt is extremely weak, we can crack it in seconds by testing common passwords. Python's `crypt` module can generate MD5-crypt hashes with the same algorithm and compare:
+
+```python
+import crypt
+
+# The hash extracted from the firmware
+target_hash = '$1$$iC.dUsGpxNNJGeOm1dFio/'
+
+# The salt format for MD5-crypt with empty salt
+salt = '$1$$'
+
+# Dictionary of common default passwords
+wordlist = ['admin', '', 'password', '1234', 'root', 'tplink', 'tp-link']
+
+for password in wordlist:
+    # crypt.crypt() generates a hash using the same algorithm and salt
+    generated_hash = crypt.crypt(password, salt)
+    if generated_hash == target_hash:
+        print(f'PASSWORD CRACKED: "{password}"')
+        break
+```
+
+**How it works:**
+1. `crypt.crypt(password, salt)` takes a candidate password and the salt format (`$1$$` = MD5-crypt, empty salt)
+2. It generates a hash using the **same algorithm** the router used when it originally stored the password
+3. If the generated hash **matches** the hash from the firmware, we found the password
+
+### Result
+
+```
+PASSWORD CRACKED: "1234"
+```
+
+| Field | Value |
+|-------|-------|
+| **Username** | `admin` |
+| **Password** | `1234` |
+| **UID** | 0 (root) |
+| **Shell** | `/bin/sh` |
+
+This password grants **full root access** to the device — web interface, SSH (Dropbear on port 22), and the UART console that was previously blocking us.
+
+### Why This Is a Security Problem
+
+- The password hash uses **MD5-crypt** — broken and deprecated since 2012
+- The salt is **empty** — eliminates the entire purpose of salting
+- The password `1234` is trivially guessable even without hash cracking
+- The admin account runs as **UID 0 (root)** — there is no privilege separation
+- The same credential is used for **all access methods** (web, SSH, UART, telnet)
+
+---
+
 ## Security Observations
 
-1. **Hardcoded credentials** — The admin password hash is stored in plaintext in `passwd.bak` within the firmware image. Any attacker with firmware access can attempt offline cracking.
+1. **Hardcoded credentials** — The admin password hash (`1234`) is stored in `passwd.bak` within the firmware image, crackable in seconds with a simple Python script.
 
 2. **Root-level admin** — The admin user runs as UID 0 (root), meaning web interface compromise equals full device control.
 
-3. **UART console present but locked** — The UART login prompt exists but doesn't grant shell access without credentials. However, since the credentials are embedded in the firmware, dumping the flash defeats this protection.
+3. **UART console present but locked** — The UART login prompt exists but doesn't grant shell access without credentials. However, since the credentials are embedded in the firmware, dumping the flash defeats this protection. With the cracked password `1234`, we can now log in via UART as well.
 
 4. **Legacy kernel** — Linux 2.6.36 (released 2010) lacks over a decade of security patches, including many known privilege escalation and remote exploits.
 
